@@ -22,11 +22,12 @@ STOPWORDS = {
 }
 
 COLORS = [
-    "lightyellow", "lightgoldenrod", "khaki",
+    "lightgoldenrod", "khaki",
     "lightgreen", "palegreen", "springgreen",
     "lightblue", "skyblue", "deepskyblue",
     "paleturquoise", "turquoise", "aquamarine",
     "lightcyan", "cyan",
+    "lightyellow", 
     "lavender", "thistle", "plum", "violet",
     "mistyrose", "lightpink", "pink",
     "lightsalmon", "salmon", "coral",
@@ -38,11 +39,27 @@ COLORS = [
 # 🔹 Utility Functions
 # -----------------------------
 def normalize_word(word):
-    """Remove Tamil suffixes for variation detection"""
+    """Smart Tamil normalization"""
+    
+    # Step 1: Remove known verb suffixes
     suffixes = ["ன்", "ான்", "ின்", "ிறான்", "த்தான்", "ட்டான்"]
     for suf in suffixes:
         if word.endswith(suf):
-            return word[:-len(suf)]
+            word = word[:-len(suf)]
+            break
+
+    # Step 2: Remove sandhi ONLY if safe
+    sandhi_suffixes = ["த்", "க்", "ப்", "ச்"]
+
+    for suf in sandhi_suffixes:
+        if word.endswith(suf):
+            base = word[:-len(suf)]
+            
+            # IMPORTANT CONDITION:
+            # Only remove if base is meaningful length
+            if len(base) >= 3:
+                return base
+    
     return word
 
 def extract_tamil_words(text):
@@ -114,53 +131,80 @@ def analyze_file(file_path, ignore_var, variation_var, result_box):
 # -----------------------------
 def get_word_color_map(text, ignore_stopwords, detect_variations):
     """Generate color map for duplicate words"""
-    words = extract_tamil_words(text)
-    
-    if ignore_stopwords:
-        words = [w for w in words if w not in STOPWORDS]
-    
-    if detect_variations:
-        words = [normalize_word(w) for w in words]
-    
-    counts = Counter(words)
-    
+    original_words = extract_tamil_words(text)
+
+    normalized_map = []
+    for w in original_words:
+        key = normalize_word(w) if detect_variations else w
+        normalized_map.append((w, key))
+
+    # Count using normalized keys
+    counts = Counter([key for _, key in normalized_map])
+
+    # Assign colors
     color_map = {}
     color_index = 0
-    
-    for word, count in counts.items():
-        if count > 1:
-            color_map[word] = COLORS[color_index % len(COLORS)]
-            color_index += 1
-    
-    return color_map, counts, len(words)
 
-def apply_highlights(editor, color_map):
-    """Apply color highlights to duplicate words"""
-    # Remove existing highlight tags
+    for key, count in counts.items():
+        if count > 1:
+            color = COLORS[color_index % len(COLORS)]
+            color_index += 1
+            
+            # Assign same color to ALL original forms
+            for original, k in normalized_map:
+                if k == key:
+                    color_map[original] = color
+    
+    return color_map, counts, len(original_words)
+
+def apply_highlights(editor, ignore_stopwords, detect_variations):
+    """Apply highlights using normalized comparison"""
+    
+    # Clear old tags
     for tag in editor.tag_names():
         if tag.startswith("word_"):
-            editor.tag_remove(tag, "1.0", tk.END)
+            editor.tag_delete(tag)
+
+    text = editor.get("1.0", tk.END)
+    words = extract_tamil_words(text)
+
+    word_positions = []
     
-    text_content = editor.get("1.0", tk.END)
-    
-    for word, color in color_map.items():
-        tag_name = f"word_{word}"
-        start = "1.0"
+    # Build word positions with normalized forms
+    index = "1.0"
+    for word in words:
+        pos = editor.search(word, index, stopindex=tk.END)
+        if not pos:
+            continue
         
-        while True:
-            pos = editor.search(word, start, stopindex=tk.END)
-            if not pos:
-                break
-            
-            full_index = len(editor.get("1.0", pos))
-            
-            if is_whole_word(text_content, full_index, word):
-                end = f"{pos}+{len(word)}c"
-                editor.tag_add(tag_name, pos, end)
-            
-            start = f"{pos}+{len(word)}c"
+        key = normalize_word(word) if detect_variations else word
         
-        editor.tag_config(tag_name, background=color)
+        if ignore_stopwords and key in STOPWORDS:
+            index = f"{pos}+{len(word)}c"
+            continue
+        
+        word_positions.append((word, key, pos))
+        index = f"{pos}+{len(word)}c"
+
+    # Count normalized keys
+    from collections import Counter
+    counts = Counter([key for _, key, _ in word_positions])
+
+    color_index = 0
+    key_color = {}
+
+    for key, count in counts.items():
+        if count > 1:
+            key_color[key] = COLORS[color_index % len(COLORS)]
+            color_index += 1
+
+    # Apply highlights
+    for word, key, pos in word_positions:
+        if key in key_color:
+            tag = f"word_{key}"
+            end = f"{pos}+{len(word)}c"
+            editor.tag_add(tag, pos, end)
+            editor.tag_config(tag, background=key_color[key])
 
 def update_sidebar(word_listbox, counts, color_map):
     """Update the side panel with duplicate words"""
@@ -201,7 +245,7 @@ def highlight_live(editor, word_listbox, limit_entry, buffer_entry,
     
     # Update UI
     word_count_var.set(str(total_words))
-    apply_highlights(editor, color_map)
+    apply_highlights(editor, ignore_var.get(), variation_var.get())
     update_sidebar(word_listbox, counts, color_map)
     check_word_limit(editor, total_words, limit_entry, buffer_entry)
 
@@ -237,34 +281,37 @@ def insert_period(editor, highlight_func):
 # -----------------------------
 # 🔹 Word Navigation
 # -----------------------------
-def focus_word(event, editor, word_listbox):
-    """Highlight word when clicked in sidebar"""
+def focus_word(event, editor, word_listbox, detect_variations):
+    """Highlight word (including variations) when clicked in sidebar"""
+    
     selection = word_listbox.get(tk.ACTIVE)
     if not selection:
         return
     
-    word = selection.split(" ")[0]
-    
-    # Remove previous focus highlight
+    selected_word = selection.rsplit(" (", 1)[0]
+
+    # Remove old highlights
     editor.tag_remove("focus", "1.0", tk.END)
-    
-    # Find and highlight all occurrences
-    text_content = editor.get("1.0", tk.END)
-    start = "1.0"
-    
-    while True:
-        pos = editor.search(word, start, stopindex=tk.END)
+
+    text = editor.get("1.0", tk.END)
+    words = extract_tamil_words(text)
+
+    index = "1.0"
+
+    for word in words:
+        pos = editor.search(word, index, stopindex=tk.END)
         if not pos:
-            break
+            continue
         
-        full_index = len(editor.get("1.0", pos))
+        key = normalize_word(word) if detect_variations else word
         
-        if is_whole_word(text_content, full_index, word):
+        # Compare normalized form
+        if key == selected_word:
             end = f"{pos}+{len(word)}c"
             editor.tag_add("focus", pos, end)
         
-        start = f"{pos}+{len(word)}c"
-    
+        index = f"{pos}+{len(word)}c"
+
     editor.tag_config("focus", background="blue", foreground="white")
 
 # -----------------------------
@@ -437,8 +484,10 @@ def create_live_tab(notebook, app, ignore_var, variation_var, limit_entry, buffe
     editor.bind("<Control-z>", lambda e: editor.edit_undo())
     editor.bind("<Control-y>", lambda e: editor.edit_redo())
     
-    word_listbox.bind("<<ListboxSelect>>", 
-                      lambda e: focus_word(e, editor, word_listbox))
+    word_listbox.bind(
+    "<<ListboxSelect>>",
+    lambda e: focus_word(e, editor, word_listbox, variation_var.get())
+)
     
     return live_tab
 def create_options_frame(parent):
@@ -464,7 +513,7 @@ def create_options_frame(parent):
                    variable=ignore_var).pack(side="left", padx=10)
     
     # Detect variations
-    variation_var = tk.BooleanVar()
+    variation_var = tk.BooleanVar(value=True)
     tk.Checkbutton(options_frame, text="Detect Variations", 
                    variable=variation_var).pack(side="left")
     
